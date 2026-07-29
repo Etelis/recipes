@@ -212,7 +212,8 @@ strategies:
 # command's env prelude), `docker_args` (extra `docker run` flags the option
 # needs, spliced into the Docker rendering while it is active), `brands`
 # (hardware-brand allowlist — absent = every brand), `docs_url` (rendered as a
-# "Docs ↗" link under the row), and `requires_opt_in` (see below).
+# "Docs ↗" link under the row), `group` (see kv_offload_groups below), and
+# `requires_opt_in` (see below).
 #
 # `requires_opt_in: true` INVERTS the repo's usual fail-open convention for one
 # option: it stays disabled until a recipe names it in `kv_offload_support`
@@ -220,20 +221,47 @@ strategies:
 # model-dependent enough that silently offering it everywhere would be a
 # correctness claim the catalog hasn't earned. Options without the key keep the
 # old behaviour — offered on every non-omni recipe.
+
+# Merged pills. Options sharing a `group` collapse into ONE pill on the KV
+# Offload row, and picking it reveals a nested sub-row listing the members —
+# the same idiom as Mooncake's merged pill + Store Topology row. Use a group
+# when the members are one framework configured differently rather than
+# genuinely separate choices; it also keeps the row from growing a pill per
+# variant. `order` positions the merged pill among the ungrouped options.
+kv_offload_groups:
+  offloading:
+    display_name: "Offloading Connector"
+    label: "Offloading"
+    order: 2
+    sub_row_label: "Offload Tiers"
+    docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
+    # Short form for the merged pill's tooltip; the full background renders
+    # under the row once a member is active.
+    tooltip: "Offloading Connector — vLLM's built-in KV offload path: extends the prefix cache into host DRAM, optionally backed by further tiers. Composes with the selected strategy."
+    # Framework-level background, rendered under the KV Offload row while any
+    # member is active; the tier-specific text belongs to the sub-row.
+    description: "vLLM's built-in OffloadingConnector extends the prefix cache beyond GPU memory: completed KV blocks are copied out by DMA alongside compute and promoted back on a hit. A CPU DRAM tier is always present and is the only tier with GPU access; optional secondary tiers sit behind it and stage their transfers through it. Pick the tiers below."
 kv_offload:
   simple:
     display_name: "Simple (CPU offload)"
     label: "Simple"
-    # Pill position on the KV Offload row; the merged Mooncake pill sits at 4.
+    # Pill position on the KV Offload row; the merged Offloading pill sits
+    # at 2 and the merged Mooncake pill at 3.
     order: 1
     description: "Offload KV cache to CPU DRAM on each serving node via SimpleCPUOffloadConnector — one flag, no extra infrastructure. ~220 GiB of host RAM used per GPU rank."
     args:
       - "--kv-transfer-config"
       - '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use_per_rank":236223201280,"lazy_offload":"false"}}'
+  # Members of the `offloading` merged pill. They differ only in which tiers
+  # sit behind the CPU tier, so their labels name the tiers rather than the
+  # spec: the spec choice (CPUOffloadingSpec vs TieringOffloadingSpec) is an
+  # implementation consequence of that pick, not the thing being chosen.
   offloading_cpu:
-    display_name: "Offloading Connector — CPU"
-    label: "Offloading"
-    order: 2
+    display_name: "CPU DRAM only"
+    label: "CPU"
+    group: offloading
+    # Leading member — the first click on the merged pill lands here.
+    order: 1
     requires_opt_in: true
     # CUDA, ROCm and XPU only. The taxonomy's Intel profiles are Xeon CPU
     # backends (no XPU device) and Google's are TPU, so neither can host the
@@ -241,32 +269,31 @@ kv_offload:
     brands:
       - NVIDIA
       - AMD
-    docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
-    description: "Extend the prefix cache into host DRAM via OffloadingConnector (CPUOffloadingSpec). Completed blocks are copied out by DMA alongside compute and promoted back on a hit, under LRU eviction. Note that cpu_bytes_to_use is the total across all workers — not per rank, as Simple's knob is — and wants to be larger than the aggregate GPU KV cache, or the CPU tier just mirrors what the GPU already holds."
+    description: "Single CPU DRAM tier (CPUOffloadingSpec), under LRU eviction. Note that cpu_bytes_to_use is the total across all workers — not per rank, as Simple's knob is — and wants to be larger than the aggregate GPU KV cache, or the CPU tier just mirrors what the GPU already holds."
     args:
       - "--kv-transfer-config"
       - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":549755813888,"blocks_per_chunk":4}}'
-  offloading_tiered:
-    display_name: "Offloading Connector — CPU + disk"
-    label: "Offloading + Disk"
-    order: 3
+  offloading_fs:
+    display_name: "CPU DRAM + filesystem"
+    label: "CPU + Filesystem"
+    group: offloading
+    order: 2
     requires_opt_in: true
     brands:
       - NVIDIA
       - AMD
-    docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
-    description: "OffloadingConnector with TieringOffloadingSpec — a CPU DRAM primary tier backed by a filesystem tier, so prefix KV outlives DRAM capacity and survives a restart. Only the CPU tier can touch GPU memory; disk transfers stage through it, which is why the CPU tier here is a modest staging tier and the disk carries the capacity. Point root_dir at fast local NVMe, or at a shared PVC to pool one cache across instances. Object-store and RDMA-peer tiers slot into the same secondary_tiers list."
+    description: "Adds a filesystem tier behind the CPU tier (TieringOffloadingSpec), so cached prefixes outlive DRAM capacity and survive a restart. The CPU tier becomes a staging tier — smaller, since the filesystem carries the capacity. Point root_dir at fast local NVMe, or at a shared mount to pool one cache across instances. Object-store (obj) and RDMA-peer (p2p) tiers configure the same way, in the same secondary_tiers list."
     # Block content hashes are seeded from NONE_HASH, which Python randomises
-    # per process unless PYTHONHASHSEED is pinned. Without this the on-disk
-    # cache is written under different filenames every restart and never hits.
+    # per process unless PYTHONHASHSEED is pinned. Without this the stored
+    # blocks land under different filenames every restart and never hit.
     env:
       PYTHONHASHSEED: "0"
-    # Unlike every other option on this row, the tiered spec's CPU tier is a
-    # /dev/shm mmap shared across workers (SharedOffloadRegion), sized to
-    # cpu_bytes_to_use and pre-faulted at startup. Docker's default /dev/shm is
-    # 64 MB, so the container needs an explicit --shm-size above the tier size
-    # or the engine dies on ftruncate. Keep this comfortably ahead of
-    # cpu_bytes_to_use below if you retune it.
+    # Alone among the options on this row, TieringOffloadingSpec backs its CPU
+    # tier with a /dev/shm mmap shared across workers (SharedOffloadRegion),
+    # sized to cpu_bytes_to_use and pre-faulted at startup. Docker's default
+    # /dev/shm is 64 MB, so the container needs an explicit --shm-size above
+    # the tier size or the engine dies on ftruncate. Retuning either of these
+    # two numbers means retuning the other.
     docker_args:
       - "--shm-size"
       - "40g"
@@ -275,8 +302,8 @@ kv_offload:
       - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":34359738368,"blocks_per_chunk":4,"eviction_policy":"lru","secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv_cache","n_read_threads":32,"n_write_threads":16}]}}'
   lmcache:
     display_name: "LMCache"
-    # Pill position on the KV Offload row (after the Mooncake pill at 4).
-    order: 5
+    # Pill position on the KV Offload row (after the Mooncake pill at 3).
+    order: 4
     description: "Offload KV cache to a shared CPU-DRAM pool via LMCacheMPConnector — prefix caching beyond GPU KV capacity, one pool per node (not per-rank segments). Adds an LMCache Server tab; run it in a separate terminal before vllm serve."
     # Single-node only: the companion MP server is node-local, so multi-node
     # engines are out (pd_cluster / kv_store_lb are already excluded for every
