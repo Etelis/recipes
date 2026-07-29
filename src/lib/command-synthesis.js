@@ -283,6 +283,38 @@ export function isKvOffloadAllowedForStrategy(option, strategyName, strategy) {
 }
 
 /**
+ * Whether a recipe permits a composing KV-offload option. Fail-OPEN by default
+ * (Simple/LMCache are offered everywhere), with two opt-outs:
+ *
+ *   - `requires_opt_in: true` on the option inverts the default to fail-CLOSED
+ *     — the recipe must name it `verified` under `kv_offload_support`. Used for
+ *     connectors whose viability is model-dependent, so the catalog only
+ *     advertises them where someone has actually run them.
+ *   - `kv_offload_support: { <key>: unsupported }` opts a recipe out of an
+ *     otherwise-open option, mirroring `meta.hardware`'s tri-state.
+ */
+export function isKvOffloadSupportedForRecipe(option, optionKey, recipe) {
+  if (!option) return false;
+  const support = recipe?.kv_offload_support?.[optionKey];
+  if (support === "unsupported") return false;
+  if (option.requires_opt_in) return support === "verified";
+  return true;
+}
+
+/**
+ * Whether a composing KV-offload option can run on a hardware profile. An
+ * option may declare a `brands` allowlist when its transfer path is built for
+ * specific accelerators — e.g. OffloadingConnector's DMA path ships for CUDA,
+ * ROCm and XPU, which rules out the Xeon CPU and TPU profiles. Absent = every
+ * brand, matching the repo's fail-open hardware convention.
+ */
+export function isKvOffloadBrandSupported(option, hwProfile) {
+  const allow = option?.brands;
+  if (!Array.isArray(allow) || allow.length === 0) return true;
+  return allow.includes(hwProfile?.brand);
+}
+
+/**
  * The effective mode key for a (feature, variant, hardware, user-selection)
  * tuple — the single source of truth shared by the command emitter and the UI.
  * Only considers modes allowed on this variant + hardware, then prefers, in
@@ -732,6 +764,20 @@ export function resolveCommand(recipe, variantKey, strategyName, hwProfileId, en
     : null;
   const kvComposing = !!kvStoreStrat && strategy.deploy_type !== "pd_cluster";
 
+  // The composing taxonomy option (Simple / Offloading / LMCache), resolved
+  // once so its args and env can't disagree about whether it is active. All
+  // four gates have to pass: the option exists, the strategy allows it, the
+  // recipe permits it (fail-closed for `requires_opt_in`), and the hardware
+  // brand is in its allowlist. A URL param naming a gated option therefore
+  // emits nothing rather than a command the recipe never vouched for.
+  const kvOptRaw = taxonomy?.kv_offload?.[kvOffload];
+  const kvOpt = kvOptRaw
+    && isKvOffloadAllowedForStrategy(kvOptRaw, strategyName, strategy)
+    && isKvOffloadSupportedForRecipe(kvOptRaw, kvOffload, recipe)
+    && isKvOffloadBrandSupported(kvOptRaw, hwProfile)
+    ? kvOptRaw
+    : null;
+
   // kv composition only: instance count + which instance's command is being
   // rendered (0-based — affects the multi-node --master-addr naming below).
   // `kvInstances` accepts a bare count or { count, current }.
@@ -1039,13 +1085,12 @@ export function resolveCommand(recipe, variantKey, strategyName, hwProfileId, en
       if (featArgs) args.push(...featArgs);
     }
 
-    // 8. Composing KV offload (taxonomy.kv_offload.<key>: Simple, LMCache) —
-    //    the option's --kv-transfer-config is appended last so it wins the
-    //    last-wins dedupe over any earlier occurrence. Gating (pd/kv_store
-    //    exclusion + per-option strategy allowlist) lives in
-    //    isKvOffloadAllowedForStrategy, shared with the UI pills.
-    const kvOpt = taxonomy?.kv_offload?.[kvOffload];
-    if (kvOpt && isKvOffloadAllowedForStrategy(kvOpt, strategyName, strategy)) {
+    // 8. Composing KV offload (taxonomy.kv_offload.<key>: Simple, Offloading,
+    //    LMCache) — the option's --kv-transfer-config is appended last so it
+    //    wins the last-wins dedupe over any earlier occurrence. `kvOpt` is
+    //    already gated on strategy, recipe opt-in and hardware brand above;
+    //    the same helpers back the UI pills.
+    if (kvOpt) {
       args.push(...(kvOpt.args || []));
     }
     // Mooncake composes the same way on any non-PD serving strategy: the
@@ -1084,6 +1129,15 @@ export function resolveCommand(recipe, variantKey, strategyName, hwProfileId, en
       Object.assign(env, strategy.env || {});
     } else if (roleOverride && strategy[roleOverride]?.env) {
       Object.assign(env, strategy[roleOverride].env);
+    }
+    // Composing-option env (taxonomy.kv_offload.<key>.env), after the strategy
+    // so the option wins the overlap — e.g. the tiered Offloading option pins
+    // PYTHONHASHSEED so block hashes, and thus on-disk filenames, are stable
+    // across restarts and across instances sharing a root_dir. Mutually
+    // exclusive with the Mooncake branch below: `kvOffload` names either a
+    // taxonomy option or a kv_store deployment id, never both.
+    if (kvOpt?.env) {
+      Object.assign(env, kvOpt.env);
     }
     // Mooncake composition: instances (any serving strategy) and PD roles
     // read the shared config via MOONCAKE_CONFIG_PATH (+ PYTHONHASHSEED for
@@ -1463,17 +1517,15 @@ export function resolveCommand(recipe, variantKey, strategyName, hwProfileId, en
       command: String(feat.companion.command).trimEnd(),
     }];
   });
-  const kvCompanionOpt = taxonomy?.kv_offload?.[kvOffload];
-  if (kvCompanionOpt?.companion?.command
-      && isKvOffloadAllowedForStrategy(kvCompanionOpt, strategyName, strategy)) {
+  if (kvOpt?.companion?.command) {
     companions.push({
       feature: `kv_offload:${kvOffload}`,
-      label: kvCompanionOpt.companion.label || kvOffload,
+      label: kvOpt.companion.label || kvOffload,
       description: [
-        kvCompanionOpt.companion.description || "",
-        kvCompanionOpt.install ? `Requires: ${kvCompanionOpt.install}` : "",
+        kvOpt.companion.description || "",
+        kvOpt.install ? `Requires: ${kvOpt.install}` : "",
       ].filter(Boolean).join(" "),
-      command: String(kvCompanionOpt.companion.command).trimEnd(),
+      command: String(kvOpt.companion.command).trimEnd(),
     });
   }
   return {

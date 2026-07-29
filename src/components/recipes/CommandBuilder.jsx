@@ -4,7 +4,7 @@ import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { Copy, Check, Terminal, Gauge, Sparkles, ChevronDown, Package, Info, Zap, Globe, Wrench, Brain } from "lucide-react";
-import { resolveCommand, recommendStrategy, isPrecisionCompatible, isHardwareSupported, isVariantHardwareSupported, fitsSingleNode, isHardwareScalable, isKvStoreBrandSupported, variantRunsOnHardware, pickFittingVariant, pickDefaultHardware, resolveSingleNodeTp, computeDockerMeta, buildDockerRun, resolveOmniCommand, pdPoolModes, defaultModeFor, isModeSupported, isModeAllowedForVariant, resolveModeKey, isFeatureAllowedForStrategy, isKvOffloadAllowedForStrategy, MAX_NODES, nodesForStrategy, isStrategyReachable } from "@/lib/command-synthesis";
+import { resolveCommand, recommendStrategy, isPrecisionCompatible, isHardwareSupported, isVariantHardwareSupported, fitsSingleNode, isHardwareScalable, isKvStoreBrandSupported, variantRunsOnHardware, pickFittingVariant, pickDefaultHardware, resolveSingleNodeTp, computeDockerMeta, buildDockerRun, resolveOmniCommand, pdPoolModes, defaultModeFor, isModeSupported, isModeAllowedForVariant, resolveModeKey, isFeatureAllowedForStrategy, isKvOffloadAllowedForStrategy, isKvOffloadSupportedForRecipe, isKvOffloadBrandSupported, MAX_NODES, nodesForStrategy, isStrategyReachable } from "@/lib/command-synthesis";
 import { resolveOmniTasks } from "@/lib/omni-tasks";
 import { TooltipProvider, InfoTip } from "@/components/ui/tooltip";
 import { detectPlaceholdersAll, substitute, substituteEnv, loadEndpoints, saveEndpoint, clearEndpoints } from "@/lib/cluster-endpoints";
@@ -345,9 +345,11 @@ const MOONCAKE_BACKGROUND =
 const MOONCAKE_DOCS_URL =
   "https://docs.vllm.ai/en/stable/features/mooncake_store_connector_usage";
 // Where the merged Mooncake pill sorts among taxonomy.kv_offload options
-// (their `order` fields are chosen around this): Off · Simple(1) ·
-// Mooncake(2) · LMCache(3).
-const MOONCAKE_PILL_ORDER = 2;
+// (their `order` fields are chosen around this). The row groups the in-engine
+// connectors before the ones fronting external infrastructure:
+// Off · Simple(1) · Offloading(2) · Offloading + Disk(3) · Mooncake(4) ·
+// LMCache(5).
+const MOONCAKE_PILL_ORDER = 4;
 
 export function CommandBuilder({ recipe, strategies, taxonomy }) {
   const searchParams = useSearchParams();
@@ -907,14 +909,27 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
     ? strategyOverride
     : recommendedServingStrategy;
   // Downgrade an unusable KV-offload pick instead of rendering a broken
-  // command: composing options (taxonomy.kv_offload — Simple, LMCache) can't
-  // run under pd_cluster (which owns --kv-transfer-config) or outside their
-  // own `strategies` allowlist; Mooncake needs scalable hardware not opted
-  // out by the recipe.
+  // command: composing options (taxonomy.kv_offload — Simple, Offloading,
+  // LMCache) can't run under pd_cluster (which owns --kv-transfer-config) or
+  // outside their own `strategies` allowlist, must be permitted by the recipe
+  // (fail-closed for `requires_opt_in`), and must match the option's `brands`
+  // allowlist; Mooncake needs scalable hardware not opted out by the recipe.
   const kvOffloadOptions = taxonomy.kv_offload || {};
+  // Split into the three independent reasons so the pill can say WHICH one
+  // failed rather than a generic "unavailable" — same helpers synthesis uses,
+  // so a disabled pill and an empty command can never disagree.
+  const kvOptGates = useCallback((key) => {
+    const opt = kvOffloadOptions[key];
+    return {
+      strategy: isKvOffloadAllowedForStrategy(opt, activeServingStrategy, strategies[activeServingStrategy]),
+      recipe: isKvOffloadSupportedForRecipe(opt, key, recipe),
+      brand: isKvOffloadBrandSupported(opt, hwProfile),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kvOffloadOptions, activeServingStrategy, strategies, recipe, hwProfile]);
   const activeKvOffload =
     kvOffloadOptions[kvOffload]
-      ? (isKvOffloadAllowedForStrategy(kvOffloadOptions[kvOffload], activeServingStrategy, strategies[activeServingStrategy]) ? kvOffload : "")
+      ? (Object.values(kvOptGates(kvOffload)).every(Boolean) ? kvOffload : "")
       : compatibleKvStoreStrategies.includes(kvOffload) && hwScalable
           && isKvStoreBrandSupported(hwProfile) && isKvStoreSupported(kvOffload)
         ? kvOffload
@@ -2098,12 +2113,22 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                 // joins the same ordered list at MOONCAKE_PILL_ORDER, so the
                 // row reads Off · Simple · Mooncake · LMCache.
                 const pills = Object.entries(kvOffloadOptions).map(([key, opt]) => {
-                  const allowed = isKvOffloadAllowedForStrategy(opt, activeServingStrategy, strategies[activeServingStrategy]);
+                  const gates = kvOptGates(key);
+                  const allowed = gates.strategy && gates.recipe && gates.brand;
+                  const name = opt.display_name || key;
                   // Say WHY it's disabled and what would enable it, not just
-                  // "not available" — the allowlist gives us the answer.
-                  const disabledTitle = activeServingStrategy === "pd_cluster"
-                    ? `${opt.display_name || key} can't compose with PD cluster, which owns --kv-transfer-config. (Mooncake composes with PD instead.)`
-                    : `${opt.display_name || key} works with: ${(opt.strategies || []).map((s) => strategies[s]?.display_name || s).join(", ")}.`;
+                  // "not available". Report the gates the user can't fix from
+                  // another row first (recipe, then hardware, then strategy),
+                  // so the tooltip never suggests a knob that won't help.
+                  const disabledTitle = !gates.recipe
+                    ? (recipe.kv_offload_support?.[key] === "unsupported"
+                      ? `${name} is marked unsupported for this recipe.`
+                      : `${name} is not enabled for this recipe yet. It stays off until the recipe records a verified run under kv_offload_support.`)
+                    : !gates.brand
+                      ? `${name} needs a CUDA, ROCm or XPU device — not available on ${hwProfile.brand || ""} ${hwProfile.display_name || hwId} backends.`
+                      : activeServingStrategy === "pd_cluster"
+                        ? `${name} can't compose with PD cluster, which owns --kv-transfer-config. (Mooncake composes with PD instead.)`
+                        : `${name} works with: ${(opt.strategies || []).map((s) => strategies[s]?.display_name || s).join(", ")}.`;
                   return {
                     order: opt.order ?? 99,
                     el: (

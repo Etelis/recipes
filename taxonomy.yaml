@@ -208,21 +208,65 @@ strategies:
 # per-option keys: `strategies` (allowlist — absent = every serving strategy),
 # `companion` ({ label, description?, command } — helper process rendered as
 # an extra command tab while the option is active), `install` (extra pip dep,
-# shown on the companion tab).
+# shown on the companion tab), `env` ({KEY: value} merged into the serve
+# command's env prelude), `brands` (hardware-brand allowlist — absent = every
+# brand), `docs_url` (rendered as a "Docs ↗" link under the row), and
+# `requires_opt_in` (see below).
+#
+# `requires_opt_in: true` INVERTS the repo's usual fail-open convention for one
+# option: it stays disabled until a recipe names it in `kv_offload_support`
+# (`{ <option_key>: verified }`). Use it for a connector whose behaviour is
+# model-dependent enough that silently offering it everywhere would be a
+# correctness claim the catalog hasn't earned. Options without the key keep the
+# old behaviour — offered on every non-omni recipe.
 kv_offload:
   simple:
     display_name: "Simple (CPU offload)"
     label: "Simple"
-    # Pill position on the KV Offload row; the merged Mooncake pill sits at 2.
+    # Pill position on the KV Offload row; the merged Mooncake pill sits at 4.
     order: 1
     description: "Offload KV cache to CPU DRAM on each serving node via SimpleCPUOffloadConnector — one flag, no extra infrastructure. ~220 GiB of host RAM used per GPU rank."
     args:
       - "--kv-transfer-config"
       - '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use_per_rank":236223201280,"lazy_offload":"false"}}'
+  offloading_cpu:
+    display_name: "Offloading Connector — CPU"
+    label: "Offloading"
+    order: 2
+    requires_opt_in: true
+    # CUDA, ROCm and XPU only. The taxonomy's Intel profiles are Xeon CPU
+    # backends (no XPU device) and Google's are TPU, so neither can host the
+    # GPU-side DMA path.
+    brands:
+      - NVIDIA
+      - AMD
+    docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
+    description: "Extend the prefix cache into host DRAM via OffloadingConnector (CPUOffloadingSpec). Completed blocks are copied out by DMA alongside compute and promoted back on a hit, under LRU eviction. Note that cpu_bytes_to_use is the total across all workers — not per rank, as Simple's knob is — and wants to be larger than the aggregate GPU KV cache, or the CPU tier just mirrors what the GPU already holds."
+    args:
+      - "--kv-transfer-config"
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":549755813888,"blocks_per_chunk":4}}'
+  offloading_tiered:
+    display_name: "Offloading Connector — CPU + disk"
+    label: "Offloading + Disk"
+    order: 3
+    requires_opt_in: true
+    brands:
+      - NVIDIA
+      - AMD
+    docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
+    description: "OffloadingConnector with TieringOffloadingSpec — a CPU DRAM primary tier backed by a filesystem tier, so prefix KV outlives DRAM capacity and survives a restart. Only the CPU tier can touch GPU memory; disk transfers stage through it. Point root_dir at fast local NVMe, or at a shared PVC to pool one cache across instances. Object-store and RDMA-peer tiers slot into the same secondary_tiers list."
+    # Block content hashes are seeded from NONE_HASH, which Python randomises
+    # per process unless PYTHONHASHSEED is pinned. Without this the on-disk
+    # cache is written under different filenames every restart and never hits.
+    env:
+      PYTHONHASHSEED: "0"
+    args:
+      - "--kv-transfer-config"
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":274877906944,"blocks_per_chunk":4,"eviction_policy":"lru","secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv_cache","n_read_threads":32,"n_write_threads":16}]}}'
   lmcache:
     display_name: "LMCache"
-    # Pill position on the KV Offload row (after the Mooncake pill at 2).
-    order: 3
+    # Pill position on the KV Offload row (after the Mooncake pill at 4).
+    order: 5
     description: "Offload KV cache to a shared CPU-DRAM pool via LMCacheMPConnector — prefix caching beyond GPU KV capacity, one pool per node (not per-rank segments). Adds an LMCache Server tab; run it in a separate terminal before vllm serve."
     # Single-node only: the companion MP server is node-local, so multi-node
     # engines are out (pd_cluster / kv_store_lb are already excluded for every

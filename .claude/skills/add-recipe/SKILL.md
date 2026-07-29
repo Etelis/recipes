@@ -160,8 +160,8 @@ compatible_strategies:            # subset of the SERVING strategies in strategi
   - multi_node_dep                # for MoE
   - multi_node_tep                # for MoE
   - pd_cluster                    # only if the recipe documents PD
-  # Do NOT list kv_store_* ids — the KV Offload options (Simple + both
-  # Mooncake modes) are implicit on every non-omni recipe.
+  # Do NOT list kv_store_* ids — the KV Offload options (Simple, LMCache and
+  # both Mooncake modes) are implicit on every non-omni recipe.
 
 # Optional opt-OUT for the Mooncake pills on the command builder's
 # "KV Offload" row. Fail-open like meta.hardware: absent = assumed to work
@@ -172,6 +172,18 @@ compatible_strategies:            # subset of the SERVING strategies in strategi
 kv_cache_strategy_hardware:
   kv_store_distributed_mooncake:
     gb200: unsupported
+
+# Optional per-recipe gate for the COMPOSING KV Offload options (the ones
+# defined in `taxonomy.yaml → kv_offload`, as opposed to the Mooncake
+# deployments above). Two directions, depending on the option:
+#   - Normal options (simple, lmcache) are fail-OPEN — omit this key and they
+#     are offered; `unsupported` disables one.
+#   - Options marked `requires_opt_in: true` in the taxonomy (offloading_cpu,
+#     offloading_tiered) are fail-CLOSED — their pill stays disabled until
+#     listed `verified` here. Only mark one `verified` after actually running
+#     this model with it; the disabled tooltip tells readers the recipe hasn't.
+kv_offload_support:
+  offloading_cpu: verified
 
 hardware_overrides:               # optional per-generation flags
   hopper:    { extra_args: [], extra_env: {} }
@@ -233,7 +245,7 @@ So `vram_minimum_gb = ceil(real_checkpoint_GB × 1.2)` (Qwen3.6-27B-NVFP4 → `c
 
 - **Feature keys**: prefer `tool_calling`, `reasoning`, `spec_decoding`. Don't use `mtp` — it's been renamed across the repo.
 - **Strategy list**: MoE recipes usually support every serving strategy; dense recipes are limited to `single_node_tp` and `multi_node_tp` (TEP/DEP require MoE). KV offload is a separate axis and is NOT listed here — Off / Simple / both Mooncake modes are implicit on every non-omni recipe and COMPOSE with whatever serving strategy is selected (each Mooncake instance runs the strategy's exact command; parallelism never comes from the KV layer).
-- **KV Offload gating**: fail-open. Only add `kv_cache_strategy_hardware` when a Mooncake mode is known NOT to work on a specific GPU — mark that strategy × GPU pair `unsupported`. Absence = assumed to work, same convention as `meta.hardware`.
+- **KV Offload gating**: fail-open by default. Only add `kv_cache_strategy_hardware` when a Mooncake mode is known NOT to work on a specific GPU — mark that strategy × GPU pair `unsupported`. Absence = assumed to work, same convention as `meta.hardware`. The one inversion is the pair of Offloading options (`offloading_cpu`, `offloading_tiered`): they carry `requires_opt_in: true` in the taxonomy, so they are fail-CLOSED and need `kv_offload_support: { <key>: verified }` before their pill lights up. Don't add that on a new recipe unless you have actually served the model with the connector — the point of the gate is that the catalog only claims what someone ran.
 - **Variants**: quantized variants reuse the base name (`fp8`, `nvfp4`, `int4`). If the quantized checkpoint is authored by someone else (e.g. `nvidia/*-NVFP4`), set `model_id:` inside the variant.
 - **Tasks**: `omni` means served via vLLM-Omni (`vllm serve <model> --omni`). Add a top-level `omni:` block listing the task ids the recipe supports — bare strings for catalog defaults (`tasks: [t2i]`) or `{ id, model_id?, vram_minimum_gb?, description?, extra_args? }` overrides when a task swaps the checkpoint (Wan2.2) or needs per-task flags. Audio-only recipes set `omni.serve_binary: "vllm-omni serve"`. The catalog is `src/lib/omni-tasks.js`; do not add `--omni` to `model.base_args` (auto-injected).
 
