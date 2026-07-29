@@ -350,6 +350,9 @@ const MOONCAKE_DOCS_URL =
 // Off · Simple(1) · Offloading(2) · Offloading + Disk(3) · Mooncake(4) ·
 // LMCache(5).
 const MOONCAKE_PILL_ORDER = 4;
+// Stable empty array so the kvDockerArgs memo keeps referential identity when
+// the active option contributes no docker flags (the common case).
+const NO_DOCKER_ARGS = [];
 
 export function CommandBuilder({ recipe, strategies, taxonomy }) {
   const searchParams = useSearchParams();
@@ -1577,7 +1580,16 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
   // is a constant.
   const altCudaSuffix = "cu129";
 
-  const dockerMeta = useMemo(() => {
+  // Extra `docker run` flags demanded by the active KV Offload option. Only
+  // the tiered Offloading option uses this today: its CPU tier is a /dev/shm
+  // mmap, and Docker's 64 MB default would fail the region's ftruncate.
+  // Reads activeKvOffload, so a gated-off option contributes nothing.
+  const kvDockerArgs = useMemo(
+    () => kvOffloadOptions[activeKvOffload]?.docker_args || NO_DOCKER_ARGS,
+    [kvOffloadOptions, activeKvOffload],
+  );
+
+  const dockerMetaBase = useMemo(() => {
     const meta = computeDockerMeta(recipe, currentVariant, hwProfile, hwId);
     if (meta.brandKey !== "nvidia") return meta;
 
@@ -1606,6 +1618,14 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
     }
     return meta;
   }, [recipe, currentVariant, hwProfile, hwId, dockerCudaVariant, altCudaSuffix]);
+
+  // The KV option's docker flags ride ON dockerMeta rather than as a separate
+  // prop: every command block (single / multi-node / PD / kv-store) already
+  // receives dockerMeta, and they render in their own component scopes.
+  const dockerMeta = useMemo(
+    () => ({ ...dockerMetaBase, extraFlags: kvDockerArgs }),
+    [dockerMetaBase, kvDockerArgs],
+  );
 
   // `installMode` carries the user's tab choice; `effectiveInstallMode` folds
   // in constraints that would hide a tab entirely (pip: recipe opt-out or TPU
@@ -2106,12 +2126,17 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                 <span className="font-semibold">Off</span>
               </Pill>
               {(() => {
-                // Composing options (Simple, LMCache) share the gating helper
-                // with synthesis: pd_cluster always excluded, plus the
-                // option's own `strategies` allowlist (LMCache = single-node
-                // only; its MP server is node-local). The merged Mooncake pill
-                // joins the same ordered list at MOONCAKE_PILL_ORDER, so the
-                // row reads Off · Simple · Mooncake · LMCache.
+                // Composing options (Simple, Offloading, Offloading + Disk,
+                // LMCache) share their gating helpers with synthesis, so a
+                // disabled pill and an empty command can't disagree. Three
+                // gates, via kvOptGates: pd_cluster/kv_store always excluded
+                // plus the option's own `strategies` allowlist (LMCache =
+                // single-node only; its MP server is node-local); the recipe's
+                // `kv_offload_support` (fail-closed for the `requires_opt_in`
+                // Offloading pair); and the option's `brands` allowlist. The
+                // merged Mooncake pill joins the same ordered list at
+                // MOONCAKE_PILL_ORDER, so the row reads
+                // Off · Simple · Offloading · Offloading + Disk · Mooncake · LMCache.
                 const pills = Object.entries(kvOffloadOptions).map(([key, opt]) => {
                   const gates = kvOptGates(key);
                   const allowed = gates.strategy && gates.recipe && gates.brand;
@@ -2724,7 +2749,7 @@ function SingleCommandBlock({ command, env, companions, verifyCmd, benchCmd, sta
   // block tabs above). Pip mode: prelude = `export KEY=VAL` lines.
   const prelude = isDocker ? "" : envToExports(env);
   const displayCommand = isDocker
-    ? buildDockerRun({ command, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+    ? buildDockerRun({ command, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, extraFlags: dockerMeta.extraFlags })
     : command;
   // A companion process may ride along (`companions[]` from resolveCommand —
   // a feature's `companion:` or the active kv_offload option's, e.g.
@@ -3077,7 +3102,7 @@ function MultiNodeBlock({ result, verifyCmd, benchCmd, statusHeader, installMode
   const isDocker = installMode === "docker";
   const wrap = (cmd) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env: result.env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env: result.env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, extraFlags: dockerMeta.extraFlags })
       : cmd;
   const tabs = [
     { id: "head", label: "Head", command: wrap(result.headCommand) },
@@ -3135,7 +3160,7 @@ function PdClusterBlock({ result, verifyCmd, benchCmd, statusHeader, onRankChang
   // it stays as-is with its pip-install hint regardless of install mode.
   const wrap = (cmd, env) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, extraFlags: dockerMeta.extraFlags })
       : cmd;
   // Mooncake composed into PD (result.mooncake): a "Mooncake Config" tab
   // (launch step 0) writes the shared config file(s) once — every
@@ -3269,7 +3294,7 @@ function KvStoreLbBlock({ result, verifyCmd, benchCmd, statusHeader, onInstanceC
   const isDocker = installMode === "docker";
   const wrap = (cmd, env) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, extraFlags: dockerMeta.extraFlags })
       : cmd;
 
   const instances = result.instances || 2;

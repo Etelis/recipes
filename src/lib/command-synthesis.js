@@ -568,13 +568,17 @@ function dockerGpuArgv(meta) {
 // Wrap a `vllm serve MODEL <args>` command in `docker run`. The vllm/vllm-openai
 // image's entrypoint is `vllm serve`, so we pass MODEL and the trailing args as
 // CMD. Env vars become `-e KEY=VAL` inside the container.
-export function buildDockerRun({ command, env, image, gpuFlags, port = 8000 }) {
+export function buildDockerRun({ command, env, image, gpuFlags, extraFlags = [], port = 8000 }) {
   const envFlags = Object.entries(env || {})
     .map(([k, v]) => `-e ${k}=${v}`)
     .join(" \\\n  ");
   const modelId = command.match(/^vllm serve (\S+)/)?.[1] || "MODEL";
   const serveBody = command.replace(/^vllm serve \S+\s*\\?\n?\s*/, "");
-  return `docker run ${gpuFlags} \\
+  // Option-supplied run flags (taxonomy `kv_offload.<key>.docker_args`) —
+  // e.g. the tiered Offloading option's --shm-size, without which its
+  // /dev/shm-backed CPU tier can't be created inside the container.
+  const extra = (extraFlags || []).length ? ` ${extraFlags.join(" ")}` : "";
+  return `docker run ${gpuFlags}${extra} \\
   --privileged --ipc=host -p ${port}:${port} \\
   -v ~/.cache/huggingface:/root/.cache/huggingface \\${envFlags ? `\n  ${envFlags} \\` : ""}
   ${image} ${modelId}${serveBody ? ` \\\n  ${serveBody}` : ""}`;
@@ -583,7 +587,7 @@ export function buildDockerRun({ command, env, image, gpuFlags, port = 8000 }) {
 // argv companion to buildDockerRun. `argv` here is the inner command's argv —
 // `["vllm", "serve", "<model>", ...flags]` from formatArgv. Returns the full
 // docker-run argv ready to spawn without a shell.
-export function buildDockerArgv({ argv, env, meta, port = 8000 }) {
+export function buildDockerArgv({ argv, env, meta, extraFlags = [], port = 8000 }) {
   const envFlags = [];
   for (const [k, v] of Object.entries(env || {})) {
     envFlags.push("-e", `${k}=${v}`);
@@ -594,6 +598,7 @@ export function buildDockerArgv({ argv, env, meta, port = 8000 }) {
   return [
     "docker", "run",
     ...dockerGpuArgv(meta),
+    ...(extraFlags || []),
     "--privileged", "--ipc=host",
     "-p", `${port}:${port}`,
     "-v", "~/.cache/huggingface:/root/.cache/huggingface",

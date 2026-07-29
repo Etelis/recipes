@@ -209,9 +209,10 @@ strategies:
 # `companion` ({ label, description?, command } — helper process rendered as
 # an extra command tab while the option is active), `install` (extra pip dep,
 # shown on the companion tab), `env` ({KEY: value} merged into the serve
-# command's env prelude), `brands` (hardware-brand allowlist — absent = every
-# brand), `docs_url` (rendered as a "Docs ↗" link under the row), and
-# `requires_opt_in` (see below).
+# command's env prelude), `docker_args` (extra `docker run` flags the option
+# needs, spliced into the Docker rendering while it is active), `brands`
+# (hardware-brand allowlist — absent = every brand), `docs_url` (rendered as a
+# "Docs ↗" link under the row), and `requires_opt_in` (see below).
 #
 # `requires_opt_in: true` INVERTS the repo's usual fail-open convention for one
 # option: it stays disabled until a recipe names it in `kv_offload_support`
@@ -254,15 +255,24 @@ kv_offload:
       - NVIDIA
       - AMD
     docs_url: "https://docs.vllm.ai/en/stable/features/kv_offloading_usage"
-    description: "OffloadingConnector with TieringOffloadingSpec — a CPU DRAM primary tier backed by a filesystem tier, so prefix KV outlives DRAM capacity and survives a restart. Only the CPU tier can touch GPU memory; disk transfers stage through it. Point root_dir at fast local NVMe, or at a shared PVC to pool one cache across instances. Object-store and RDMA-peer tiers slot into the same secondary_tiers list."
+    description: "OffloadingConnector with TieringOffloadingSpec — a CPU DRAM primary tier backed by a filesystem tier, so prefix KV outlives DRAM capacity and survives a restart. Only the CPU tier can touch GPU memory; disk transfers stage through it, which is why the CPU tier here is a modest staging tier and the disk carries the capacity. Point root_dir at fast local NVMe, or at a shared PVC to pool one cache across instances. Object-store and RDMA-peer tiers slot into the same secondary_tiers list."
     # Block content hashes are seeded from NONE_HASH, which Python randomises
     # per process unless PYTHONHASHSEED is pinned. Without this the on-disk
     # cache is written under different filenames every restart and never hits.
     env:
       PYTHONHASHSEED: "0"
+    # Unlike every other option on this row, the tiered spec's CPU tier is a
+    # /dev/shm mmap shared across workers (SharedOffloadRegion), sized to
+    # cpu_bytes_to_use and pre-faulted at startup. Docker's default /dev/shm is
+    # 64 MB, so the container needs an explicit --shm-size above the tier size
+    # or the engine dies on ftruncate. Keep this comfortably ahead of
+    # cpu_bytes_to_use below if you retune it.
+    docker_args:
+      - "--shm-size"
+      - "40g"
     args:
       - "--kv-transfer-config"
-      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":274877906944,"blocks_per_chunk":4,"eviction_policy":"lru","secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv_cache","n_read_threads":32,"n_write_threads":16}]}}'
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":34359738368,"blocks_per_chunk":4,"eviction_policy":"lru","secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv_cache","n_read_threads":32,"n_write_threads":16}]}}'
   lmcache:
     display_name: "LMCache"
     # Pill position on the KV Offload row (after the Mooncake pill at 4).
